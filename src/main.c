@@ -61,6 +61,7 @@ double adcrFiltered, adctFiltered;
 int autoSensorBaud2 = 0; // in USART2_IT_init
 int autoSensorBaud3 = 0; // in USART3_IT_init
 
+bool SoftWatchdogActive= false;
 bool ADCcontrolActive = false;
 
 int sensor_control = 0;
@@ -127,7 +128,12 @@ void poweroff() {
         enable = 0;
         for (int i = 0; i < 8; i++) {
             buzzerFreq = i;
-            HAL_Delay(100);
+            for(int j = 0; j < 100; j++) {
+                #ifdef SOFTWATCHDOG_TIMEOUT
+                    __HAL_TIM_SET_COUNTER(&htim3, 0); // Kick the Watchdog
+                #endif
+                HAL_Delay(1);
+            }
         }
         HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, 0);
 
@@ -182,8 +188,10 @@ const FLASH_CONTENT FlashDefaults = {
   .adc.adc_off_start = ADC_OFF_START,
   .adc.adc_off_end = ADC_OFF_END,
   .adc.adc_off_filter = ADC_OFF_FILTER,
+  .adc.adc_relative_steer = ADC_RELATIVE_STEER,
   .adc.adc_switch_channels = ADC_SWITCH_CHANNELS,
   .adc.adc_reverse_steer = ADC_REVERSE_STEER,
+  .adc.adc_squared_steer = ADC_SQUARED_STEER,
   .adc.adc_tankmode = ADC_TANKMODE,
 };
 
@@ -363,8 +371,8 @@ int main(void) {
 
   #endif
 
-    // enables interrupt reading of hall sensors for dead reconing wheel position.
-    HallInterruptinit();
+  // enables interrupt reading of hall sensors for dead reconing wheel position.
+  HallInterruptinit();
 
   #ifdef CONTROL_PPM
     PPM_Init();
@@ -426,6 +434,11 @@ int main(void) {
   // uses timeStats.bldc_freq
   BldcControllerParams.callFrequency = timeStats.bldc_freq;
   BldcController_Init();
+
+#ifdef SOFTWATCHDOG_TIMEOUT
+  MX_TIM3_Softwatchdog_Init(); // Start the WAtchdog
+  SoftWatchdogActive= true;
+#endif
 
   while(1) {
     timeStats.time_in_us = timeStats.now_us;
@@ -681,8 +694,8 @@ int main(void) {
                   //Change actuator value
                   int pwm = PositionPidFloats[i].out;
                   pwms[i] = pwm;
-                    }
                 }
+              }
               break;
             case CONTROL_TYPE_SPEED:
               for (int i = 0; i < 2; i++){
@@ -715,8 +728,8 @@ int main(void) {
                     pwms[i] =
                       CLAMP(pwms[i] + pwm, -SpeedData.speed_max_power, SpeedData.speed_max_power);
                   }
-                  }
                 }
+              }
               break;
 
             case CONTROL_TYPE_PWM:
@@ -729,9 +742,66 @@ int main(void) {
       }
 
       #if defined CONTROL_ADC
+
         if(ADCcontrolActive) {
+
+#ifdef ADC_SPEED_CONTROL
+          control_type = CONTROL_TYPE_SPEED;
+          SpeedData.wanted_speed_mm_per_sec[1] = CLAMP(speed * SPEED_COEFFICIENT -  steer * STEER_COEFFICIENT, -1000, 1000);
+          SpeedData.wanted_speed_mm_per_sec[0] = CLAMP(speed * SPEED_COEFFICIENT +  steer * STEER_COEFFICIENT, -1000, 1000);
+
+
+          if ((last_control_type != control_type) || (!enable)){
+            // nasty things happen if it's not re-initialised
+            init_PID_control();
+            last_control_type = control_type;
+          }
+
+
+
+
+
+              for (int i = 0; i < 2; i++){
+                // average speed over all the loops until pid_need_compute() returns !=0
+                SpeedPidFloats[i].in += HallData[i].HallSpeed_mm_per_s;
+                SpeedPidFloats[i].count++;
+                if (!enable){ // don't want anything building up
+                  SpeedPidFloats[i].in = 0;
+                  SpeedPidFloats[i].count = 1;
+                }
+                if (pid_need_compute(&SpeedPid[i])) {
+                  // Read process feedback
+                  int belowmin = 0;
+                  // won't work below about 45
+                  if (ABS(SpeedData.wanted_speed_mm_per_sec[i]) < SpeedData.speed_minimum_speed){
+                    SpeedPidFloats[i].set = 0;
+                    belowmin = 1;
+                  } else {
+                    SpeedPidFloats[i].set = SpeedData.wanted_speed_mm_per_sec[i];
+                  }
+                  SpeedPidFloats[i].in = SpeedPidFloats[i].in/(float)SpeedPidFloats[i].count;
+                  SpeedPidFloats[i].count = 0;
+                  // Compute new PID output value
+                  pid_compute(&SpeedPid[i]);
+                  //Change actuator value
+                  int pwm = SpeedPidFloats[i].out;
+                  if (belowmin){
+                    pwms[i] = 0;
+                  } else {
+                    pwms[i] =
+                      CLAMP(pwms[i] + pwm, -SpeedData.speed_max_power, SpeedData.speed_max_power);
+                  }
+                }
+              }
+
+#else
+
           cmd1 = cmd1_ADC;
           cmd2 = cmd2_ADC;
+
+#endif
+
+
           input_timeout_counter = 0;
         }
       #endif
@@ -762,8 +832,10 @@ int main(void) {
           pwms[0] = pwms[0] * (1.0 - FILTER) + cmd1 * FILTER;
           pwms[1] = pwms[1] * (1.0 - FILTER) + cmd2 * FILTER;
         } else {
-          pwms[0] = CLAMP(speed * SPEED_COEFFICIENT -  steer * STEER_COEFFICIENT, -1000, 1000);
-          pwms[1] = CLAMP(speed * SPEED_COEFFICIENT +  steer * STEER_COEFFICIENT, -1000, 1000);
+          #ifndef ADC_SPEED_CONTROL
+            pwms[0] = CLAMP(speed * SPEED_COEFFICIENT -  steer * STEER_COEFFICIENT, -1000, 1000);
+            pwms[1] = CLAMP(speed * SPEED_COEFFICIENT +  steer * STEER_COEFFICIENT, -1000, 1000);
+          #endif
         }
       }
 
@@ -956,6 +1028,10 @@ int main(void) {
     // select next loop start point
     // move out '5ms' trigger on by 5ms
     timeStats.start_processing_us = timeStats.start_processing_us + timeStats.nominal_delay_us;
+
+#ifdef SOFTWATCHDOG_TIMEOUT
+    __HAL_TIM_SET_COUNTER(&htim3, 0); // Kick the Watchdog
+#endif
 
     ////////////////////////////////
     // increase input_timeout_counter
